@@ -20,26 +20,41 @@ const fs = require('fs');
 const path = require('path');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FAIL FAST – require all connection environment variables at startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REQUIRED_ENV = [
+    'PG_USER', 'PG_HOST', 'PG_DATABASE', 'PG_PASSWORD',
+    'SQL_USER', 'SQL_PASSWORD', 'SQL_SERVER', 'SQL_DATABASE',
+];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length > 0) {
+    console.error(`Missing required environment variables: ${missingEnv.join(', ')}`);
+    process.exit(2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CONNECTION CONFIGS  (values injected via environment variables)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const pgConfig = {
-    user:     process.env.PG_USER     || 'your_pg_username',
-    host:     process.env.PG_HOST     || 'localhost',
-    database: process.env.PG_DATABASE || 'product_api',
-    password: process.env.PG_PASSWORD || 'your_pg_password',
+    user:     process.env.PG_USER,
+    host:     process.env.PG_HOST,
+    database: process.env.PG_DATABASE,
+    password: process.env.PG_PASSWORD,
     port:     parseInt(process.env.PG_PORT || '5432', 10),
 };
 
 const sqlConfig = {
-    user:     process.env.SQL_USER     || 'your_sql_username',
-    password: process.env.SQL_PASSWORD || 'your_sql_password',
-    server:   process.env.SQL_SERVER   || 'localhost',
-    database: process.env.SQL_DATABASE || 'publisher_db',
+    user:     process.env.SQL_USER,
+    password: process.env.SQL_PASSWORD,
+    server:   process.env.SQL_SERVER,
+    database: process.env.SQL_DATABASE,
     authentication: { type: 'default' },
     options: {
         encrypt: true,
-        trustServerCertificate: true,
+        // Set SQL_TRUST_SERVER_CERT=true only in non-production environments
+        trustServerCertificate: process.env.SQL_TRUST_SERVER_CERT === 'true',
     },
 };
 
@@ -68,22 +83,24 @@ async function pgQuery(client, queryText, params = []) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1 – COUNT CHECKS
 //   Compare record totals for each data domain between the two systems.
+//   Table names come from a hardcoded whitelist to prevent SQL injection.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Whitelisted table mappings – never accept user/external input for table names
+const DOMAIN_TABLE_MAP = [
+    { label: 'Products',         pgTable: 'products',         sqlTable: 'synced_products'         },
+    { label: 'Itineraries',      pgTable: 'itineraries',      sqlTable: 'synced_itineraries'       },
+    { label: 'Policies',         pgTable: 'policies',         sqlTable: 'synced_policies'          },
+    { label: 'Departures',       pgTable: 'departures',       sqlTable: 'synced_departures'        },
+    { label: 'Related Products', pgTable: 'related_products', sqlTable: 'synced_related_products'  },
+    { label: 'Prices',           pgTable: 'prices',           sqlTable: 'synced_prices'            },
+];
 
 async function runCountChecks(pgClient) {
     log('--- COUNT CHECKS ---');
-    const domains = [
-        { label: 'Products',         pgTable: 'products',         sqlTable: 'synced_products'  },
-        { label: 'Itineraries',      pgTable: 'itineraries',      sqlTable: 'synced_itineraries' },
-        { label: 'Policies',         pgTable: 'policies',         sqlTable: 'synced_policies'  },
-        { label: 'Departures',       pgTable: 'departures',       sqlTable: 'synced_departures' },
-        { label: 'Related Products', pgTable: 'related_products', sqlTable: 'synced_related_products' },
-        { label: 'Prices',           pgTable: 'prices',           sqlTable: 'synced_prices'    },
-    ];
-
     const results = [];
 
-    for (const domain of domains) {
+    for (const domain of DOMAIN_TABLE_MAP) {
         try {
             const pgRows  = await pgQuery(pgClient, `SELECT COUNT(*) AS cnt FROM ${domain.pgTable}`);
             const pgCount = parseInt(pgRows[0].cnt, 10);
@@ -91,8 +108,8 @@ async function runCountChecks(pgClient) {
             const sqlResult = await sql.query(`SELECT COUNT(*) AS cnt FROM ${domain.sqlTable}`);
             const sqlCount  = sqlResult.recordset[0].cnt;
 
-            const diff    = pgCount - sqlCount;
-            const status  = diff === 0 ? 'MATCH' : 'MISMATCH';
+            const diff   = pgCount - sqlCount;
+            const status = diff === 0 ? 'MATCH' : 'MISMATCH';
 
             log(`[COUNT] ${domain.label}: ProductAPI=${pgCount}, Starship/Elements=${sqlCount}, Diff=${diff} → ${status}`);
             results.push({ domain: domain.label, pgCount, sqlCount, diff, status });
@@ -124,18 +141,27 @@ async function runFieldLevelChecks(pgClient) {
     results.push({ check: 'null_name_or_status', count: nullFields.length, samples: nullFields.slice(0, 5) });
 
     // 2b. Products whose status differs between the two systems
+    //     Fetch from each DB separately, then compare in application code.
     try {
-        const mismatchResult = await sql.query(`
-            SELECT s.product_id, s.status AS starship_status, p.status AS papi_status
-            FROM   synced_products s
-            JOIN   products        p ON p.id = s.product_id
-            WHERE  s.status <> p.status
+        const papiStatusRows = await pgQuery(pgClient, `
+            SELECT id, status FROM products
         `);
-        const mismatches = mismatchResult.recordset;
+        const papiStatusMap = new Map(papiStatusRows.map(r => [String(r.id), r.status]));
+
+        const starshipResult = await sql.query(`SELECT product_id, status FROM synced_products`);
+        const mismatches = starshipResult.recordset.filter(r => {
+            const papiStatus = papiStatusMap.get(String(r.product_id));
+            return papiStatus !== undefined && papiStatus !== r.status;
+        }).map(r => ({
+            product_id:      r.product_id,
+            starship_status: r.status,
+            papi_status:     papiStatusMap.get(String(r.product_id)),
+        }));
+
         log(`[FIELD] Products with status mismatch: ${mismatches.length}`);
         results.push({ check: 'status_mismatch', count: mismatches.length, samples: mismatches.slice(0, 5) });
     } catch (err) {
-        log(`[FIELD] Status mismatch check skipped (cross-DB join not supported directly): ${err.message}`);
+        log(`[FIELD] status_mismatch check error: ${err.message}`);
         results.push({ check: 'status_mismatch', error: err.message });
     }
 
@@ -240,6 +266,8 @@ async function runReferentialIntegrityChecks(pgClient) {
 // SECTION 4 – SYNC STATUS
 //   Identify products present in Starship/Elements but absent in Product API,
 //   and vice-versa (source-of-truth gap analysis).
+//   Product IDs are fetched from each system separately, then compared in JS
+//   to avoid unsupported cross-database joins.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function runSyncStatusChecks(pgClient) {
@@ -247,43 +275,34 @@ async function runSyncStatusChecks(pgClient) {
     const results = [];
 
     try {
-        // Products in Starship/Elements but NOT in Product API
-        const missingInPapi = await sql.query(`
-            SELECT product_id
-            FROM   synced_products
-            WHERE  product_id NOT IN (SELECT id FROM products)
-        `);
-        const missingInPapiCount = missingInPapi.recordset.length;
-        log(`[SYNC] Products in Starship/Elements but missing from Product API: ${missingInPapiCount}`);
-        results.push({
-            check: 'missing_in_product_api',
-            count: missingInPapiCount,
-            samples: missingInPapi.recordset.slice(0, 5),
-        });
-    } catch (err) {
-        log(`[SYNC] missing_in_product_api check error: ${err.message}`);
-        results.push({ check: 'missing_in_product_api', error: err.message });
-    }
+        // Fetch all product IDs from both systems
+        const papiIdRows     = await pgQuery(pgClient, `SELECT id FROM products`);
+        const papiIds        = new Set(papiIdRows.map(r => String(r.id)));
 
-    // Products in Product API but NOT synced to Starship/Elements
-    try {
-        const unsynced = await pgQuery(pgClient, `
-            SELECT p.id, p.name, p.status
-            FROM   products p
-            WHERE  NOT EXISTS (
-                SELECT 1 FROM synced_products sp WHERE sp.product_id = p.id
-            )
-            AND    p.status = 'published'
-        `);
-        log(`[SYNC] Published products in Product API not yet synced to Starship/Elements: ${unsynced.length}`);
+        const starshipResult = await sql.query(`SELECT product_id FROM synced_products`);
+        const starshipIds    = new Set(starshipResult.recordset.map(r => String(r.product_id)));
+
+        // Products in Starship/Elements but NOT in Product API
+        const missingInPapi = [...starshipIds].filter(id => !papiIds.has(id));
+        log(`[SYNC] Products in Starship/Elements but missing from Product API: ${missingInPapi.length}`);
         results.push({
-            check: 'unsynced_published_products',
-            count: unsynced.length,
-            samples: unsynced.slice(0, 5),
+            check:   'missing_in_product_api',
+            count:   missingInPapi.length,
+            samples: missingInPapi.slice(0, 5),
+        });
+
+        // Published products in Product API not yet synced to Starship/Elements
+        const publishedRows  = await pgQuery(pgClient, `SELECT id, name FROM products WHERE status = 'published'`);
+        const unsyncedRows   = publishedRows.filter(r => !starshipIds.has(String(r.id)));
+        log(`[SYNC] Published products in Product API not yet synced to Starship/Elements: ${unsyncedRows.length}`);
+        results.push({
+            check:   'unsynced_published_products',
+            count:   unsyncedRows.length,
+            samples: unsyncedRows.slice(0, 5),
         });
     } catch (err) {
-        log(`[SYNC] unsynced_published_products check error: ${err.message}`);
-        results.push({ check: 'unsynced_published_products', error: err.message });
+        log(`[SYNC] Sync status check error: ${err.message}`);
+        results.push({ check: 'sync_status', error: err.message });
     }
 
     return results;
@@ -431,8 +450,8 @@ async function runValidation() {
         log(`FATAL ERROR – ${err.message}`);
         hasDiscrepancies = true;
     } finally {
-        await pgClient.end().catch(() => {});
-        await sql.close().catch(() => {});
+        await pgClient.end().catch(err => log(`WARN – PostgreSQL disconnect error: ${err.message}`));
+        await sql.close().catch(err => log(`WARN – SQL Server disconnect error: ${err.message}`));
 
         // Write JSON report (for Confluence/JIRA attachment)
         fs.writeFileSync(REPORT_FILE, JSON.stringify(report, null, 2));
