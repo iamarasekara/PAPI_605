@@ -96,12 +96,30 @@ const DOMAIN_TABLE_MAP = [
     { label: 'Prices',           pgTable: 'prices',           sqlTable: 'synced_prices'            },
 ];
 
+const ALLOWED_PG_TABLES  = new Set(DOMAIN_TABLE_MAP.map(d => d.pgTable));
+const ALLOWED_SQL_TABLES = new Set(DOMAIN_TABLE_MAP.map(d => d.sqlTable));
+
+function assertAllowedPgTable(name) {
+    if (!ALLOWED_PG_TABLES.has(name)) {
+        throw new Error(`Table name '${name}' is not in the allowed PostgreSQL table list`);
+    }
+}
+
+function assertAllowedSqlTable(name) {
+    if (!ALLOWED_SQL_TABLES.has(name)) {
+        throw new Error(`Table name '${name}' is not in the allowed SQL Server table list`);
+    }
+}
+
 async function runCountChecks(pgClient) {
     log('--- COUNT CHECKS ---');
     const results = [];
 
     for (const domain of DOMAIN_TABLE_MAP) {
         try {
+            assertAllowedPgTable(domain.pgTable);
+            assertAllowedSqlTable(domain.sqlTable);
+
             const pgRows  = await pgQuery(pgClient, `SELECT COUNT(*) AS cnt FROM ${domain.pgTable}`);
             const pgCount = parseInt(pgRows[0].cnt, 10);
 
@@ -450,8 +468,8 @@ async function runValidation() {
         log(`FATAL ERROR – ${err.message}`);
         hasDiscrepancies = true;
     } finally {
-        await pgClient.end().catch(err => log(`WARN – PostgreSQL disconnect error: ${err.message}`));
-        await sql.close().catch(err => log(`WARN – SQL Server disconnect error: ${err.message}`));
+        try { await pgClient.end(); } catch (err) { log(`WARN – PostgreSQL disconnect error: ${err.message}`); }
+        try { await sql.close();   } catch (err) { log(`WARN – SQL Server disconnect error: ${err.message}`); }
 
         // Write JSON report (for Confluence/JIRA attachment)
         fs.writeFileSync(REPORT_FILE, JSON.stringify(report, null, 2));
